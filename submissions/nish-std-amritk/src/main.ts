@@ -8,7 +8,7 @@
 //
 // Configured by the environment: DATABASE_URL, JWT_SECRET, HOST, PORT, EXTRA_PORT (SPEC.md), and optionally
 // HTTP_WORKERS (the CPUs), DB_READ_CONNS (128) and DB_WRITE_CONNS (32) in total over the workers,
-// DB_MAX_IN_FLIGHT (16) groups pipelined per connection, HTTP_SLOTS (262144) connections per port per worker and
+// DB_MAX_IN_FLIGHT (16) groups pipelined per connection, HTTP_SLOTS (1048576) connections per port per worker and
 // IDLE_TIMEOUT_MS (120000).
 import { availableParallelism, getenv, monotonicNanos } from "nish:process"
 import { tcpListenFlags } from "nish:net"
@@ -102,7 +102,7 @@ export const main = (): i32 => {
   cfg.readConns = reads
   cfg.writeConns = writes
   cfg.maxInFlight = envInt("DB_MAX_IN_FLIGHT", 16)
-  cfg.slots = envInt("HTTP_SLOTS", 262144)
+  cfg.slots = envInt("HTTP_SLOTS", 1048576)
   cfg.idleTimeoutMs = envInt("IDLE_TIMEOUT_MS", 120000)
   const prefork = new PreforkConfig()
   prefork.workers = workers

@@ -138,7 +138,7 @@ export class WorkerConfig {
   readConns: i32 = 8
   writeConns: i32 = 2
   maxInFlight: i32 = 16
-  slots: i32 = 262144
+  slots: i32 = 1048576
   backlog: i32 = 65535
   idleTimeoutMs: i32 = 120000
   jwtSecret: string = ""

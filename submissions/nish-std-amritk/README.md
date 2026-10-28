@@ -61,7 +61,7 @@ Carried over:
 | `DB_READ_CONNS` | 128 | total read connections, split over the workers |
 | `DB_WRITE_CONNS` | 32 | total write connections, split over the workers |
 | `DB_MAX_IN_FLIGHT` | 16 | groups pipelined on one connection |
-| `HTTP_SLOTS` | 262144 | connections per port per worker |
+| `HTTP_SLOTS` | 1048576 | connections per port per worker (the search goes up to 3,000,000 users on 4 cores: 375,000 per port per worker) |
 | `IDLE_TIMEOUT_MS` | 120000 | idle keep-alive connections are closed after this (SPEC.md asks for at least 75 s) |
 
 ## Local measurements
