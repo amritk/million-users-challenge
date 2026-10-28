@@ -38,6 +38,28 @@ to the app side. That means CPU per request and memory per idle connection, time
 - **Cheap gzip.** libdeflate at level 1 shrinks the feed from 5.1 KB to 1.9 KB. Locally it cost about 12% more server
   CPU than no gzip, and it cuts the bytes the NIC sends by 2.7x. Only the feed is over 1 KB.
 
+## Credits
+
+Ideas from other submissions, each written from the idea, not the code. Multicore challenge entries are
+[arjaythedev/multicore-server-challenge](https://github.com/arjaythedev/multicore-server-challenge) PRs:
+
+- **c-iouring-tigokraft ([#10](https://github.com/arjaythedev/multicore-server-challenge/pull/10)):** one thread per
+  core with its own `SO_REUSEPORT` listener and its own Postgres connections, nothing shared; reading into the
+  thread's scratch buffer so an idle keep-alive connection owns no buffer; a hand-written wire-protocol client that
+  pipelines prepared statements.
+- **csharp-sockets-jh-d ([#22](https://github.com/arjaythedev/multicore-server-challenge/pull/22)):** an own Postgres
+  client (SCRAM-SHA-256, extended query protocol, binary results) with every statement prepared once per connection
+  and sent as Bind/Execute/Sync; JSON written straight from binary rows; writes on their own connections so WAL
+  flushes don't stall pipelined reads.
+- **rust-tokio-Scooter1337 ([#7](https://github.com/arjaythedev/multicore-server-challenge/pull/7)):** response
+  headers on the stack and vectored writes; no buffers held while a socket is idle; prepared generic plans.
+- **rust-mio-foovoo ([#11](https://github.com/arjaythedev/multicore-server-challenge/pull/11)):** raw threads, each
+  running its own epoll loop with the Postgres sockets registered in the same loop as the client sockets.
+- **go-raw-kimmotamio ([#37](https://github.com/arjaythedev/multicore-server-challenge/pull/37)):**
+  `plan_cache_mode = force_generic_plan` as a session option.
+- **This repo's Go example ([`examples/go`](../../examples/go)):** no TCP keep-alive probes on accepted connections
+  (`TCP_KEEPALIVE=off`, part of its 248k → 650k).
+
 ## Rules
 
 - **Queries:** the SQL from `SPEC.md` verbatim, one statement per request, prepared once per connection, each with
