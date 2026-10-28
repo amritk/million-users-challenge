@@ -59,6 +59,32 @@ to the app side. That means CPU per request and memory per idle connection, time
 | `GZIP_LEVEL` | 1 | libdeflate level |
 | `GZIP_MIN` | 1024 | smallest body that gets gzipped |
 
+## Measured on Synteq boxes
+
+Three Synteq VPSs (Xeon Platinum 8260, Ubuntu 24.04): the server on a 16-vCPU / 32 GB app box set up with
+`box/setup-app-box.sh`, Postgres 18 on its own 24-vCPU box (`box/setup-db-box.sh`, `box/postgresql.conf`), and
+`mload` on a 24-vCPU / 31 GB box with 9 source IPs. Each run started from a fresh `feed` (`box/reset-db.sh`) with
+`-gzip -think-scale 2.5`.
+
+| users | ramp / hold | req/s in hold | p95 | p99 | errors | server CPU (of 16 vCPU) | result |
+|--:|--:|--:|--:|--:|--:|--:|:--|
+| 100,000 | 60 s / 2 m | 4,400 | 1.8 ms | 7.6 ms | 0 | ~3% | pass |
+| 300,000 | 120 s / 1 m | 13,000 | 10.6 ms | 32.3 ms | 0 | ~8% | pass |
+| 700,000 | 200 s / 2 m | 29,000 | 229 ms | 465 ms | 0.002% | ~16% | pass |
+| 1,000,000 | 300 s / 5 m | 40,000 | 1–9 s | 1.5–11 s | 0.006% | ~15% | fail (latency) |
+
+At 1M users all 1,000,000 connections stay open, there are no failed requests during the hold and the server uses
+about 15% of the box, but latency fails. Above about 580k open connections, every box starts retransmitting, even
+the database box with its 161 connections. That happens at a steady request rate too, and a UDP test showed no loss
+at 200k packets per second. The packets are being dropped outside the VMs, which looks like a per-VM flow/conntrack
+limit in the host network. During a 700k hold, requests sent straight to the server took 1–3 ms at p95, from
+localhost and from the database box. The latency comes from those retransmits, not from the server.
+
+What it took to load 1M users from one generator (changes to a local copy of `mload` only, none to `bench/`):
+binding users round-robin to 9 source IPs, a fixed source port per user (the kernel's port search in `connect()`
+pegged the load box at 92% system CPU past ~32k connections per destination), pooled per-request buffers (28 → 11
+KB per user), and `GOGC=1000` (GC mark assists were stalling simulated users for hundreds of ms).
+
 ## Local measurements
 
 A 4-vCPU dev container, with Postgres 16, the load generator and the server all on the same machine. The server was
