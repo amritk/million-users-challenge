@@ -49,8 +49,9 @@ Carried over:
 - Nothing in the database is created or changed. Only session settings are used.
 - **No caching:** every request reads Postgres while it is being served. Only connections and prepared statements
   are reused.
-- **Connections:** by default 128 read and 32 write in total, split evenly over the workers (8 + 2 per worker on 16
-  cores). That is 160 of the 512 allowed.
+- **Connections:** by default 48 read and 64 write in total, split evenly over the workers (3 + 4 per worker on 16
+  cores). That is 112 of the 512 allowed. See "Measured on Synteq boxes" for why reads get fewer connections than
+  writes.
 - **Compression:** when `Accept-Encoding` asks for gzip, bodies of 1 KB or more are gzipped at the fast level (Nish
   0.24.0's `HttpCompressor` and `Http1Connection.respondEncoded`). In practice that is only the feed: 5,102 bytes go
   out as 1,899. Smaller bodies (a post, a like, an error) are sent as they are, and `Vary` is left off because no cache
@@ -61,13 +62,42 @@ Carried over:
 | Variable | Default | |
 |---|---|---|
 | `HTTP_WORKERS` | the CPUs | worker processes |
-| `DB_READ_CONNS` | 128 | total read connections, split over the workers |
-| `DB_WRITE_CONNS` | 32 | total write connections, split over the workers |
+| `DB_READ_CONNS` | 48 | total read connections, split over the workers |
+| `DB_WRITE_CONNS` | 64 | total write connections, split over the workers |
 | `DB_MAX_IN_FLIGHT` | 16 | groups pipelined on one connection |
 | `HTTP_SLOTS` | 1048576 | connections per port per worker (the search goes up to 3,000,000 users on 4 cores: 375,000 per port per worker) |
 | `GZIP_LEVEL` | 1 | deflate level (1 = fast, 6 = default) |
 | `GZIP_MIN` | 1024 | smallest body that is gzipped; larger than any body (e.g. 999999) turns gzip off |
 | `IDLE_TIMEOUT_MS` | 120000 | idle keep-alive connections are closed after this (SPEC.md asks for at least 75 s) |
+
+## Measured on Synteq boxes
+
+Laid out like the official runs: the server on a 16-vCPU / 32 GB app box with 5 IPs (set up with
+`box/setup-app-box.sh`), Postgres 18 on its own 24-vCPU box (`box/setup-db-box.sh`, `box/postgresql.conf`), and
+`mload` on three load boxes (24, 16 and 16 vCPU) against every app IP and both ports, with a shared `-start`, a
+different `-offset` per process, merged at the end. Every run started from a fresh `feed` (`box/reset-db.sh`), with
+`-gzip -think-scale 2.5` and a 300 s ramp at 1M (about 3,333 new connections a second).
+
+| users | read + write conns | hold | req/s in hold | p95 | p99 | errors | app box CPU | result |
+|--:|:-:|--:|--:|--:|--:|--:|--:|:--|
+| 500,000 | 128 + 32 | 2 min | 21,000 | 10.2 ms | 23.0 ms | 0.001% | ~15% | pass |
+| 1,000,000 | 128 + 32 | 5 min | 42,000 | 409 ms | 1,335 ms | 0.000% | ~26% | fail (p99) |
+| 1,000,000 | 448 + 64 | 5 min | 40,000 | 1,460 ms | 2,131 ms | 0.000% | ~20% | fail |
+| 1,000,000 | 64 + 16 | 5 min | 42,000 | 447 ms | 2,706 ms | 0.000% | ~23% | fail (writes: p99 7 s) |
+| 1,000,000 | **48 + 64** | 5 min | 42,000 | **272 ms** | **659 ms** | 0.000% | ~21% | **pass** |
+| 1,000,000 | **48 + 64** (repeat) | 5 min | 42,000 | **221 ms** | **429 ms** | 0.000% | ~21% | **pass** |
+
+At 1M the server used about 2 of the 16 cores and 1.5 GB of RSS. The latency tail comes from packet loss between
+the VMs rather than from CPU: the database box retransmits 1,700–7,500 segments a second over its handful of
+connections, and on a pipelined connection one lost segment stalls every query queued behind it until it is
+resent. The connection counts set how much each loss costs:
+
+- **Reads:** fewer connections means fuller packets. Going from 128 to 448 read connections spread the same results
+  over more, smaller packets, more of them were lost (the database box went from ~3,000 to ~7,500 retransmits a
+  second) and p95 went from 409 ms to 1.46 s. 48 read connections took read p99 to about 430–670 ms.
+- **Writes:** every write waits for its commit's WAL flush, and the flushes on one connection run one after
+  another. With 16 write connections (one per worker) writes queued up to a p99 of 7 s. With 64 they flush in
+  parallel and write p99 is about 230 ms.
 
 ## Local measurements
 
