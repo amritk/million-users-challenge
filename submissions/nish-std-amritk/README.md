@@ -99,6 +99,43 @@ resent. The connection counts set how much each loss costs:
   another. With 16 write connections (one per worker) writes queued up to a p99 of 7 s. With 64 they flush in
   parallel and write p99 is about 230 ms.
 
+### 8 and 4 cores
+
+The same boxes with the app box cut to 8 or 4 online CPUs (`/sys/devices/system/cpu/cpuN/online`, then
+`box/setup-app-box.sh` again so the RPS mask matches), the same defaults (so 6 + 8 or 12 + 16 connections per
+worker), and 2-minute holds as in the search's first step:
+
+| cores | users | p95 | p99 | errors | app box CPU | result |
+|--:|--:|--:|--:|--:|--:|:--|
+| 8 | 1,000,000 | 202 ms | 251 ms | 0.000% | ~40% | pass |
+| 8 | 1,100,000 | 2,069 ms | 3,049 ms | 0.001% | ~42% | fail |
+| 8 | 1,250,000 | 7,105 ms | 9,021 ms | 0.163% | ~40% | fail |
+| 4 | 1,000,000 | 96 ms | 241 ms | 0.001% | ~68% | pass |
+| 4 | 1,250,000 | 5,595 ms | 6,760 ms | 0.325% | ~68% | fail |
+
+Every failure looks the same: feed and post reads take seconds while writes stay at a p95 of about 220 ms, the app
+box still has CPU to spare, and both boxes retransmit 2,000–3,000 segments a second. Past a million users the
+database sends the app box about 1 Gbit/s of rows, and on these VMs' network the read connections stall on lost
+packets before the server runs out of CPU.
+
+## Credits
+
+This is a port of this author's multicore-challenge entry, and the parts that carried over (above) came partly from
+other entries there, each written from the idea, not the code. Multicore challenge entries are
+[arjaythedev/multicore-server-challenge](https://github.com/arjaythedev/multicore-server-challenge) PRs:
+
+- **c-iouring-tigokraft ([#10](https://github.com/arjaythedev/multicore-server-challenge/pull/10)):** one worker per
+  core with its own `SO_REUSEPORT` listeners and its own Postgres connections, nothing shared; idle keep-alive
+  connections that own no buffer; pipelined prepared statements over a hand-written wire-protocol client.
+- **csharp-sockets-jh-d ([#22](https://github.com/arjaythedev/multicore-server-challenge/pull/22)):** writes on their
+  own connections, so a commit's WAL flush doesn't stall pipelined reads; JSON written straight from the rows.
+- **rust-tokio-Scooter1337 ([#7](https://github.com/arjaythedev/multicore-server-challenge/pull/7)):** no buffers held
+  while a socket is idle; prepared generic plans.
+- **rust-mio-foovoo ([#11](https://github.com/arjaythedev/multicore-server-challenge/pull/11)):** each worker's
+  Postgres sockets in the same epoll loop as its client sockets.
+- **go-raw-kimmotamio ([#37](https://github.com/arjaythedev/multicore-server-challenge/pull/37)):**
+  `plan_cache_mode = force_generic_plan` as a session option.
+
 ## Local measurements
 
 These were taken in a 4-vCPU dev container, with Postgres 16, `mload` and the server all on one machine, so they are
