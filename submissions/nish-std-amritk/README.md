@@ -1,9 +1,9 @@
 # Nish / standard library
 
-Nish 0.23.1 (a statically typed TypeScript subset compiled to native code through LLVM), built with clang-18 and
+Nish 0.24.0 (a statically typed TypeScript subset compiled to native code through LLVM), built with clang-18 and
 lld-18 from LLVM 18, against PostgreSQL 18. The compiler runs on Node.js 22.18.0 at build time only. The server is one
 native binary with no runtime dependency beyond libc. Every import is Nish's own standard library:
-`nish/net/http1-server` for HTTP/1.1, `nish/net/postgres` for the PostgreSQL wire protocol, `nish/json` and
+`nish/net/http1-server` for HTTP/1.1, `nish/net/http-compress` for gzip, `nish/net/postgres` for the PostgreSQL wire protocol, `nish/json` and
 `nish/json-tokenizer`, `nish/crypto/hmac` and `nish/net/prefork`. No third-party package is used.
 
 ```sh
@@ -51,7 +51,10 @@ Carried over:
   are reused.
 - **Connections:** by default 128 read and 32 write in total, split evenly over the workers (8 + 2 per worker on 16
   cores). That is 160 of the 512 allowed.
-- **Compression:** none yet. Nish 0.23.1's standard library has no gzip, and gzip is optional in SPEC.md.
+- **Compression:** when `Accept-Encoding` asks for gzip, bodies of 1 KB or more are gzipped at the fast level (Nish
+  0.24.0's `HttpCompressor` and `Http1Connection.respondEncoded`). In practice that is only the feed: 5,102 bytes go
+  out as 1,899. Smaller bodies (a post, a like, an error) are sent as they are, and `Vary` is left off because no cache
+  sits in front of the server.
 
 ## Configuration (env, all optional)
 
@@ -62,6 +65,8 @@ Carried over:
 | `DB_WRITE_CONNS` | 32 | total write connections, split over the workers |
 | `DB_MAX_IN_FLIGHT` | 16 | groups pipelined on one connection |
 | `HTTP_SLOTS` | 1048576 | connections per port per worker (the search goes up to 3,000,000 users on 4 cores: 375,000 per port per worker) |
+| `GZIP_LEVEL` | 1 | deflate level (1 = fast, 6 = default) |
+| `GZIP_MIN` | 1024 | smallest body that is gzipped; larger than any body (e.g. 999999) turns gzip off |
 | `IDLE_TIMEOUT_MS` | 120000 | idle keep-alive connections are closed after this (SPEC.md asks for at least 75 s) |
 
 ## Local measurements
@@ -70,9 +75,15 @@ These were taken in a 4-vCPU dev container, with Postgres 16, `mload` and the se
 not comparable to the benchmark boxes. The server ran on one core (`taskset -c 0`, `HTTP_WORKERS=1`) and `mload` on
 two others, with 15,000 users at `-think-scale 0.2`, `-gzip`, a 15 s ramp and a 40 s hold:
 
-| | req/s | p95 | p99 | errors | server CPU ticks | RSS |
-|---|--:|--:|--:|--:|--:|--:|
-| this server | 6,992 | 1.6 ms | 5.4 ms | 0 | 1,558 | 30 MB |
-| the same API in Rust (own epoll HTTP and Postgres client), no gzip | 6,988 | 3.1 ms | 7.9 ms | 0 | 1,963 | |
+| | req/s | p95 | p99 | errors | server CPU ticks |
+|---|--:|--:|--:|--:|--:|
+| this server, gzip (default) | 6,998 / 6,984 | 1.6 / 1.7 ms | 6.3 / 7.6 ms | 0 | 1,794 / 1,755 |
+| this server, gzip off (`GZIP_MIN=999999999`) | 6,995 / 6,994 | 1.3 / 1.2 ms | 2.9 / 2.5 ms | 0 | 1,507 / 1,388 |
+| the same API in Rust (own epoll HTTP and Postgres client), libdeflate gzip | 6,991 | 4.7 ms | 37.5 ms | 0 | 2,205 |
+| the same Rust server, gzip off | 6,988 | 3.1 ms | 7.9 ms | 0 | 1,963 |
+
+The two Nish rows alternated, run by run. RSS was 30 MB with the 15,000 connections open, about 2 KB per connection.
+On loopback gzip costs about 23% more server CPU, against 12% for libdeflate in Rust. It cuts the feed's bytes by
+2.7x, and the box's network is part of the test (SPEC.md), so it stays on.
 
 `test/run.sh`: 42/42.
