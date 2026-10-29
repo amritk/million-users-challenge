@@ -107,6 +107,10 @@ export const main = (): i32 => {
   cfg.gzipLevel = envInt("GZIP_LEVEL", 1)
   cfg.gzipLevel = cfg.gzipLevel > 9 ? 9 : cfg.gzipLevel
   cfg.gzipMin = envInt("GZIP_MIN", 1024)
+  cfg.batchMs = (getenv("BATCH_MS") ?? "") === "0" ? 0 : envInt("BATCH_MS", 2)
+  cfg.batchMin = envInt("BATCH_MIN", 32)
+  cfg.pack = (getenv("DB_PACK") ?? "") !== "0"
+  cfg.binary = (getenv("DB_BINARY") ?? "") !== "0"
   const prefork = new PreforkConfig()
   prefork.workers = workers
   prefork.restart = false

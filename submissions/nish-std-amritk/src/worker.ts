@@ -146,6 +146,13 @@ export class WorkerConfig {
   /** gzip: the deflate level (1 is `DEFLATE_FAST`), and the shortest body worth compressing. */
   gzipLevel: i32 = 1
   gzipMin: i32 = 1024
+  /** The wake-up batching window: after a loop turn with fewer than `batchMin` events, pause `batchMs` (0 = off). */
+  batchMs: i32 = 2
+  batchMin: i32 = 32
+  /** Reads fill one connection to `maxInFlight` before the next (`PgConfig.pack`), so their results go in fuller packets. */
+  pack: boolean = true
+  /** Reads ask for binary results: ids, like counts and timestamps come as fixed-size integers, not text. */
+  binary: boolean = true
   /** `monotonicNanos` when the server started, for /health's `uptime_s`. */
   started: i64 = 0
 
@@ -257,7 +264,7 @@ class PgSocket {
   armed: i32 = 0
 }
 
-const pgConfig = (cfg: WorkerConfig): PgConfig => {
+const pgConfig = (cfg: WorkerConfig, pack: boolean): PgConfig => {
   const config = new PgConfig()
   config.user = cfg.dbUser
   config.database = cfg.dbName
@@ -267,6 +274,7 @@ const pgConfig = (cfg: WorkerConfig): PgConfig => {
   config.options =
     "-c plan_cache_mode=force_generic_plan -c jit=off -c max_parallel_workers_per_gather=0 -c DateStyle=ISO -c TimeZone=UTC"
   config.maxInFlight = cfg.maxInFlight
+  config.pack = pack
   config.inputSize = 65536
   config.maxOutput = PG_MAX_OUTPUT
   return config
@@ -276,6 +284,11 @@ export class FeedWorker {
   servers: Http1Server[]
   listeners: i32[]
   loop: i32 = -1
+  /** An epoll set with nothing in it: waiting on it is the batching window's pause. */
+  pause: i32 = -1
+  batchMs: i32 = 2
+  batchMin: i32 = 32
+  binary: boolean = true
   jwt: Jwt
   pools: PgPool[]
   sockets: PgSocket[][]
@@ -306,6 +319,10 @@ export class FeedWorker {
     // Nearly every one of the million connections sits between requests: none holds an input or head buffer then.
     http.idleInput = true
     this.loop = pollCreate()
+    this.pause = pollCreate()
+    this.batchMs = cfg.batchMs
+    this.batchMin = cfg.batchMin
+    this.binary = cfg.binary
     this.listeners = listeners
     this.servers = []
     this.slotReq = []
@@ -323,8 +340,9 @@ export class FeedWorker {
     this.jwt = new Jwt(bytesOf(cfg.jwtSecret))
     const password = secret(bytesOf(cfg.dbPassword))
     this.pools = [
-      new PgPool(pgConfig(cfg), password, cfg.readConns, QUEUE),
-      new PgPool(pgConfig(cfg), password, cfg.writeConns, QUEUE),
+      new PgPool(pgConfig(cfg, cfg.pack), password, cfg.readConns, QUEUE),
+      // Writes stay spread over their connections, so their commits' WAL flushes run side by side.
+      new PgPool(pgConfig(cfg, false), password, cfg.writeConns, QUEUE),
     ]
     wipe(password)
     this.sockets = []
@@ -397,6 +415,12 @@ export class FeedWorker {
       const now: i64 = monotonicNanos()
       for (let k: i32 = 0; k < toI32(this.servers.length); k++) {
         this.servers[k].expire(now)
+      }
+      // A light turn: send what it produced, then let events gather for a moment. The next turn serves them in one
+      // wake-up, and their queries go to Postgres together, in fewer and fuller packets.
+      if (this.batchMs > 0 && n < this.batchMin) {
+        this.pump()
+        pollWait(this.pause, ready, this.batchMs)
       }
     }
   }
@@ -820,9 +844,13 @@ export class FeedWorker {
       case R_HEALTH:
         return conn.bindStart("health") && conn.bindEnd()
       case R_FEED:
-        return conn.bindStart("feed") && conn.bindEnd()
+        return (this.binary ? conn.bindStartBinary("feed") : conn.bindStart("feed")) && conn.bindEnd()
       case R_POST:
-        return conn.bindStart("post") && conn.paramInt(r.postId) && conn.bindEnd()
+        return (
+          (this.binary ? conn.bindStartBinary("post") : conn.bindStart("post")) &&
+          conn.paramInt(r.postId) &&
+          conn.bindEnd()
+        )
       case R_CREATE:
         return (
           conn.bindStart("create") &&
@@ -966,17 +994,23 @@ export class FeedWorker {
     }
   }
 
-  /** One row of SPEC.md's post query as a post object. */
+  /** One row of SPEC.md's post query as a post object, its columns in binary or in text as the bind asked. */
   post(w: JsonWriter, conn: PgConnection): void {
     const b: u8[] = conn.inputBuffer()
     w.beginObject()
     w.key("id")
-    w.raw(b, conn.colStart(0), conn.colLength(0))
+    if (this.binary) {
+      w.i64(conn.binaryInt(0))
+    } else {
+      w.raw(b, conn.colStart(0), conn.colLength(0))
+    }
     w.key("body")
     w.stringBytes(b, conn.colStart(1), conn.colLength(1))
     w.key("created_at")
     const stamp: u8[] = this.plainBuf
-    const n: i32 = conn.text.timestamp(b, conn.colStart(2), conn.colLength(2), stamp, 0)
+    const n: i32 = this.binary
+      ? conn.binary.timestamp(b, conn.colStart(2), conn.colLength(2), stamp, 0)
+      : conn.text.timestamp(b, conn.colStart(2), conn.colLength(2), stamp, 0)
     if (n < 0) {
       w.nullValue()
     } else {
@@ -985,7 +1019,11 @@ export class FeedWorker {
     w.key("author")
     w.stringBytes(b, conn.colStart(3), conn.colLength(3))
     w.key("like_count")
-    w.raw(b, conn.colStart(4), conn.colLength(4))
+    if (this.binary) {
+      w.i64(conn.binaryInt(4))
+    } else {
+      w.raw(b, conn.colStart(4), conn.colLength(4))
+    }
     w.endObject()
   }
 
