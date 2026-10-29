@@ -146,6 +146,9 @@ export class WorkerConfig {
   /** gzip: the deflate level (1 is `DEFLATE_FAST`), and the shortest body worth compressing. */
   gzipLevel: i32 = 1
   gzipMin: i32 = 1024
+  /** The wake-up batching window: after a loop turn with fewer than `batchMin` events, pause `batchMs` (0 = off). */
+  batchMs: i32 = 2
+  batchMin: i32 = 32
   /** `monotonicNanos` when the server started, for /health's `uptime_s`. */
   started: i64 = 0
 
@@ -276,6 +279,10 @@ export class FeedWorker {
   servers: Http1Server[]
   listeners: i32[]
   loop: i32 = -1
+  /** An epoll set with nothing in it: waiting on it is the batching window's pause. */
+  pause: i32 = -1
+  batchMs: i32 = 2
+  batchMin: i32 = 32
   jwt: Jwt
   pools: PgPool[]
   sockets: PgSocket[][]
@@ -306,6 +313,9 @@ export class FeedWorker {
     // Nearly every one of the million connections sits between requests: none holds an input or head buffer then.
     http.idleInput = true
     this.loop = pollCreate()
+    this.pause = pollCreate()
+    this.batchMs = cfg.batchMs
+    this.batchMin = cfg.batchMin
     this.listeners = listeners
     this.servers = []
     this.slotReq = []
@@ -397,6 +407,12 @@ export class FeedWorker {
       const now: i64 = monotonicNanos()
       for (let k: i32 = 0; k < toI32(this.servers.length); k++) {
         this.servers[k].expire(now)
+      }
+      // A light turn: send what it produced, then let events gather for a moment. The next turn serves them in one
+      // wake-up, and their queries go to Postgres together, in fewer and fuller packets.
+      if (this.batchMs > 0 && n < this.batchMin) {
+        this.pump()
+        pollWait(this.pause, ready, this.batchMs)
       }
     }
   }

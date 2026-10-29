@@ -1,6 +1,6 @@
 # Nish / standard library
 
-Nish 0.24.0 (a statically typed TypeScript subset compiled to native code through LLVM), built with clang-18 and
+Nish 0.25.0 (a statically typed TypeScript subset compiled to native code through LLVM), built with clang-18 and
 lld-18 from LLVM 18, against PostgreSQL 18. The compiler runs on Node.js 22.18.0 at build time only. The server is one
 native binary with no runtime dependency beyond libc. Every import is Nish's own standard library:
 `nish/net/http1-server` for HTTP/1.1, `nish/net/http-compress` for gzip, `nish/net/postgres` for the PostgreSQL wire protocol, `nish/json` and
@@ -37,6 +37,10 @@ Carried over:
   their digits, text goes through the JSON writer's escaper, and timestamps go through `PgText.timestamp`, which
   truncates to milliseconds. No string is made per row, and nothing is allocated per request once the worker has
   served its peak.
+- **A wake-up batching window** (from the top entries here, below). After a loop turn that handled fewer than 32
+  events, the worker sends what it has and waits 2 ms on an empty epoll set before the next turn, so one wake-up
+  serves more events and their queries go to Postgres together. At 1.1M users on 8 cores it took server CPU from
+  207% to 153% and read p95 from 2.1 s to 0.5 s.
 - **Tokens.** HS256 over an HMAC keyed once with `JWT_SECRET`, adapted from the multicore entry's `jwt.ts`: each
   signature copies the two keyed SHA-256 states. The signature, `alg` and `exp` are checked on every request, and
   nothing is cached between requests.
@@ -69,6 +73,8 @@ Carried over:
 | `GZIP_LEVEL` | 1 | deflate level (1 = fast, 6 = default) |
 | `GZIP_MIN` | 1024 | smallest body that is gzipped; larger than any body (e.g. 999999) turns gzip off |
 | `IDLE_TIMEOUT_MS` | 120000 | idle keep-alive connections are closed after this (SPEC.md asks for at least 75 s) |
+| `BATCH_MS` | 2 | after a loop turn with fewer than `BATCH_MIN` events, pause this long so the next turn serves more at once (0 = off) |
+| `BATCH_MIN` | 32 | see `BATCH_MS` |
 
 ## Measured on Synteq boxes
 
@@ -86,6 +92,7 @@ different `-offset` per process, merged at the end. Every run started from a fre
 | 1,000,000 | 64 + 16 | 5 min | 42,000 | 447 ms | 2,706 ms | 0.000% | ~23% | fail (writes: p99 7 s) |
 | 1,000,000 | **48 + 64** | 5 min | 42,000 | **272 ms** | **659 ms** | 0.000% | ~21% | **pass** |
 | 1,000,000 | **48 + 64** (repeat) | 5 min | 42,000 | **221 ms** | **429 ms** | 0.000% | ~21% | **pass** |
+| 1,000,000 | **48 + 64**, 2 ms window, Nish 0.25.0 | 5 min | 42,000 | **227 ms** | **519 ms** | 0.001% | ~17% | **pass** |
 
 At 1M the server used about 2 of the 16 cores and 1.5 GB of RSS. The latency tail comes from packet loss between
 the VMs rather than from CPU: the database box retransmits 1,700–7,500 segments a second over its handful of
@@ -113,6 +120,15 @@ worker), and 2-minute holds as in the search's first step:
 | 4 | 1,000,000 | 96 ms | 241 ms | 0.001% | ~68% | pass |
 | 4 | 1,250,000 | 5,595 ms | 6,760 ms | 0.325% | ~68% | fail |
 
+With the 2 ms batching window and Nish 0.25.0, on 8 cores:
+
+| users | hold | p95 | p99 | errors | app box CPU | result |
+|--:|--:|--:|--:|--:|--:|:--|
+| 1,100,000 | 2 min | 236 ms | 504 ms | 0.001% | ~38% | pass |
+| 1,100,000 | 5 min | 2,426 ms | 3,205 ms | 0.001% | ~37% | fail |
+| 1,250,000 | 2 min | 5,377 ms | 6,627 ms | 0.001% | ~36% | fail |
+| 1,250,000 (`BATCH_MS=4`) | 2 min | 5,999 ms | 7,105 ms | 0.001% | ~35% | fail |
+
 Every failure looks the same: feed and post reads take seconds while writes stay at a p95 of about 220 ms, the app
 box still has CPU to spare, and both boxes retransmit 2,000–3,000 segments a second. Past a million users the
 database sends the app box about 1 Gbit/s of rows, and on these VMs' network the read connections stall on lost
@@ -135,6 +151,14 @@ other entries there, each written from the idea, not the code. Multicore challen
   Postgres sockets in the same epoll loop as its client sockets.
 - **go-raw-kimmotamio ([#37](https://github.com/arjaythedev/multicore-server-challenge/pull/37)):**
   `plan_cache_mode = force_generic_plan` as a session option.
+
+From this challenge's entries ([arjaythedev/million-users-challenge](https://github.com/arjaythedev/million-users-challenge) PRs):
+
+- **c-epoll-unorig-username ([#10](https://github.com/arjaythedev/million-users-challenge/pull/10)),
+  java-epoll-stohirov ([#2](https://github.com/arjaythedev/million-users-challenge/pull/2)) and
+  rust-tokio-unorig-username ([#11](https://github.com/arjaythedev/million-users-challenge/pull/11)):** the wake-up
+  batching window, a short pause after a light loop turn so the next one serves more events and sends their
+  queries together.
 
 ## Local measurements
 
