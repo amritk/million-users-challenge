@@ -29,6 +29,7 @@ import {
   Http1Server,
 } from "nish/net/http1-server"
 import { Http1Parser } from "nish/net/http1"
+import { HTTP_CODING_IDENTITY, HttpCompressor } from "nish/net/http-compress"
 import { JsonWriter } from "nish/json"
 import {
   JSON_TOK_ARRAY_BEGIN,
@@ -142,6 +143,9 @@ export class WorkerConfig {
   backlog: i32 = 65535
   idleTimeoutMs: i32 = 120000
   jwtSecret: string = ""
+  /** gzip: the deflate level (1 is `DEFLATE_FAST`), and the shortest body worth compressing. */
+  gzipLevel: i32 = 1
+  gzipMin: i32 = 1024
   /** `monotonicNanos` when the server started, for /health's `uptime_s`. */
   started: i64 = 0
 
@@ -158,6 +162,8 @@ class FeedReq {
   slot: i32 = -1
   gen: i32 = 0
   route: i32 = 0
+  /** The coding `Accept-Encoding` asked for, read with the head. */
+  coding: i32 = 0
   /** A status to answer once the body has ended, and its message; 0 for none. */
   status: i32 = 0
   message: string = ""
@@ -195,6 +201,7 @@ class FeedReq {
     this.slot = slot
     this.gen = gen
     this.route = R_NONE
+    this.coding = HTTP_CODING_IDENTITY
     this.status = 0
     this.message = ""
     this.postId = 0
@@ -287,6 +294,7 @@ export class FeedWorker {
   plain: JsonWriter
   plainBuf: u8[]
   tokenizer: JsonTokenizer
+  gzip: HttpCompressor
   started: i64 = 0
 
   constructor(cfg: WorkerConfig, listeners: i32[]) {
@@ -367,6 +375,10 @@ export class FeedWorker {
     const limits = new JsonLimits()
     limits.maxDepth = 32
     this.tokenizer = new JsonTokenizer(this.plainBuf, 0, 0, limits)
+    // A `gzipMin` past the largest body turns gzip off (`HttpCompressor` refuses a minimum above its maximum).
+    this.gzip = new HttpCompressor(cfg.gzipLevel, cfg.gzipMin < RESPONSE_ROOM ? cfg.gzipMin : RESPONSE_ROOM, RESPONSE_ROOM)
+    // No cache sits between the load generator and the server, and `Vary` would add 24 bytes to every response.
+    this.gzip.vary = false
   }
 
   // ---- The loop ---------------------------------------------------------------------
@@ -457,6 +469,9 @@ export class FeedWorker {
       }
       event = server.next(slot)
     }
+    if (!server.holds(slot)) {
+      return // closed by `answer`
+    }
     const wants: i32 = server.flush(slot)
     if ((wants & H1_DONE) !== 0) {
       this.closeSlot(sv, slot)
@@ -511,14 +526,18 @@ export class FeedWorker {
     const server: Http1Server = this.servers[sv]
     const live: boolean =
       slot >= 0 && slot < toI32(this.slotGen[sv].length) && server.holds(slot) && this.slotGen[sv][slot] === r.gen
+    const coding: i32 = r.coding
     this.release(r)
     if (!live) {
       return
     }
     const conn: Http1Connection = server.connection(slot)
-    conn.respond(status, this.jsonNames, this.jsonValues, len)
-    conn.write(buf, 0, len)
-    conn.end()
+    // gzipped when the client asked for it and the body is at least `gzipMin` bytes, else sent as it is.
+    if (conn.respondEncoded(status, this.jsonNames, this.jsonValues, buf, 0, len, this.gzip, coding) !== 0) {
+      // No room in the output for a whole response: a client that pipelines without reading. Not served further.
+      this.closeSlot(sv, slot)
+      return
+    }
     if (later) {
       this.drive(sv, slot)
     }
@@ -548,7 +567,9 @@ export class FeedWorker {
   onHead(sv: i32, slot: i32): void {
     const r: FeedReq = this.take(sv, slot)
     this.slotReq[sv][slot] = r.index
-    const p: Http1Parser = this.servers[sv].connection(slot).parser
+    const conn: Http1Connection = this.servers[sv].connection(slot)
+    const p: Http1Parser = conn.parser
+    r.coding = conn.acceptEncoding()
     this.route(r, p)
     if (r.status !== 0 || (r.route !== R_CREATE && r.route !== R_LIKE)) {
       return

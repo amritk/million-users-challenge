@@ -1,5 +1,5 @@
 // The Million Users Challenge feed API (https://github.com/arjaythedev/million-users-challenge) in Nish, on its
-// standard library only: nish/net/http1-server, nish/net/postgres, nish/json, nish/crypto's HMAC, nish/net/prefork.
+// standard library only: nish/net/http1-server, nish/net/http-compress, nish/net/postgres, nish/json, nish/crypto's HMAC, nish/net/prefork.
 // README.md has the design and the measurements.
 //
 // One supervisor and HTTP_WORKERS worker processes (nish/net/prefork, restarts off: rule 10 does not restart a
@@ -9,7 +9,7 @@
 // Configured by the environment: DATABASE_URL, JWT_SECRET, HOST, PORT, EXTRA_PORT (SPEC.md), and optionally
 // HTTP_WORKERS (the CPUs), DB_READ_CONNS (128) and DB_WRITE_CONNS (32) in total over the workers,
 // DB_MAX_IN_FLIGHT (16) groups pipelined per connection, HTTP_SLOTS (1048576) connections per port per worker and
-// IDLE_TIMEOUT_MS (120000).
+// IDLE_TIMEOUT_MS (120000), GZIP_LEVEL (1) and GZIP_MIN (1024).
 import { availableParallelism, getenv, monotonicNanos } from "nish:process"
 import { tcpListenFlags } from "nish:net"
 import { PREFORK_STOPPED, PreforkConfig, preforkWith } from "nish/net/prefork"
@@ -104,6 +104,9 @@ export const main = (): i32 => {
   cfg.maxInFlight = envInt("DB_MAX_IN_FLIGHT", 16)
   cfg.slots = envInt("HTTP_SLOTS", 1048576)
   cfg.idleTimeoutMs = envInt("IDLE_TIMEOUT_MS", 120000)
+  cfg.gzipLevel = envInt("GZIP_LEVEL", 1)
+  cfg.gzipLevel = cfg.gzipLevel > 9 ? 9 : cfg.gzipLevel
+  cfg.gzipMin = envInt("GZIP_MIN", 1024)
   const prefork = new PreforkConfig()
   prefork.workers = workers
   prefork.restart = false
