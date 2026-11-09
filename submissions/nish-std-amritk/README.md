@@ -1,22 +1,93 @@
 # Nish / standard library
 
-An update of this submission, scored at 1,000,000 (max) / 1,250,000 / 1,070,000 in #56. Since #56, from what the
-author's multicore-challenge entry learned after this port: writes are a **group commit** (every write that arrives
-while a batch commits goes in the next one, one transaction and one WAL flush), reads go to Postgres **batched under
-one Sync**, and the compiler is **Nish 0.36.0** (from 0.26.0), whose HTTP/1.1 and Postgres paths take about a quarter
-less of the server's CPU here. Every request still runs SPEC.md's one statement.
+An update of this submission, scored at 1,000,000 (max) / 1,200,000 / 1,320,000 in #107 (and 1,000,000 (max) /
+1,250,000 / 1,070,000 in #56). This update changes two things, both TCP options on the server's own sockets that the
+top entries here set: **`TCP_THIN_LINEAR_TIMEOUTS`** on the client and Postgres sockets, and **`TCP_DEFER_ACCEPT`** on
+the listeners, with a new connection's first request served in the pass that accepts it. "This update" below has why,
+and "Credits" whose they are.
+
+Since #56, from what the author's multicore-challenge entry learned after this port: writes are a **group commit**
+(every write that arrives while a batch commits goes in the next one, one transaction and one WAL flush), reads go to
+Postgres **batched under one Sync**, and the compiler is **Nish 0.36.0** (from 0.26.0), whose HTTP/1.1 and Postgres
+paths take about a quarter less of the server's CPU here. Every request still runs SPEC.md's one statement.
 
 Nish 0.36.0 (a statically typed TypeScript subset compiled to native code through LLVM), built with clang-18 and
 lld-18 from LLVM 18, against PostgreSQL 18. The compiler runs on Node.js 22.18.0 at build time only. The server is one
 native binary with no runtime dependency beyond libc. Every import is Nish's own standard library:
 `nish/net/http1-server` for HTTP/1.1, `nish/net/http-compress` for gzip, `nish/net/postgres` for the PostgreSQL wire protocol, `nish/json` and
 `nish/json-tokenizer`, `nish/crypto/hmac` and `nish/net/prefork`. No third-party package is used.
+The one thing called outside it is libc's `setsockopt`, declared in `src/worker.ts`, for the two TCP options above:
+Nish 0.36.0's `netSetOption` has no id for them.
 
 ```sh
 sudo bash install.sh
 bash build.sh
 DATABASE_URL=postgres://feed:pw@db:5432/feed JWT_SECRET=million-users-challenge HOST=0.0.0.0 PORT=80 EXTRA_PORT=81 bash start.sh
 ```
+
+## This update
+
+**What #107's official run showed.** The server was not out of CPU where it failed:
+
+| cores | users held 5 min | p95 | p99 | app CPU | where it failed |
+|--:|--:|--:|--:|--:|:--|
+| 16 | 1,000,000 (max) | 200 ms | 223 ms | 17% | |
+| 8 | 1,200,000 | 210 ms | 232 ms | 32% | 1,299,999: p95 36 s, 17% errors |
+| 4 | 1,320,000 | 264 ms | 489 ms | 58% | 2-minute runs passed at 1,430,000; the 5-minute hold at 1,390,000 missed on p99 (1.31 s) |
+
+A p95 of about 200 ms at 17% CPU is one retransmission timeout (Linux's shortest is 200 ms): the tail is packets
+lost between the boxes, as on the author's own Synteq rig ("Measured on Synteq boxes"), and the 4-core hold missed
+on p99 alone. So this update goes after the cost of a lost packet, not CPU.
+
+**Against the #1 entry, locally.** c-epoll-unorig-username (built from arjaythedev main at 4bc0ec5, against Ubuntu's
+libisal 2.31.0 rather than its pinned 2.31.1 tarball) and #107's build of this entry, each on one core, `mload` on
+two others, 15,000 users at `-think-scale 0.2` with `-gzip` (about 7,100 requests a second), CPU over 10 s of the
+hold, two runs each (the calls were counted in a third run of each, under `strace -c`):
+
+| | server CPU per request | Postgres ticks | p95 | `send` + `recv` calls per request |
+|---|--:|--:|--:|--:|
+| c-epoll-unorig-username | 19.7 / 17.0 us | 402 / 375 | 4.5 / 4.4 ms | 1.09 + 1.10 |
+| this entry (#107) | 18.8 / 19.0 us | 367 / 384 | 5.7 / 5.7 ms | 1.10 + 1.10 |
+
+The same system calls per request, the same Postgres work and, within what two runs show, the same CPU. Under
+`mload` the gzipped feed is 932 bytes here (the load's own posts compress well), so with its 133-byte head it is
+one TCP segment, as theirs is. What that entry has and #107 lacked is the two options below.
+
+**`TCP_THIN_LINEAR_TIMEOUTS`** (on the listeners, so every client socket inherits it, and on each Postgres socket).
+While fewer than four packets are in flight, which is nearly always the case for a keep-alive client and often for
+a Postgres connection between batches, a packet lost twice is resent after one RTO each time instead of a doubled
+one: 400 ms in all, not 600, and three losses 600 ms, not 1,400. That is the difference between a request inside
+the 1 s p99 limit and one outside it.
+
+**`TCP_DEFER_ACCEPT`** (on the listeners). The kernel hands a connection to `accept` once its first request has
+arrived, and the worker reads it in the same pass (`acceptAll`), so a new connection costs one wake-up, not two.
+During a run's ramp that is 3,333 connections a second.
+
+Neither is a kernel setting (rule 13): both are options a process sets on its own sockets, as `TCP_NODELAY` is.
+`TCP_THIN=0` and `TCP_DEFER=0` turn them off.
+
+**Measured.** On the author's Synteq rig, before #107 ("#107, 4 cores" below, where they were tried and left
+out), the pair passed twice at 1,000,000 users on 4 cores with the lowest p99 of any setting: 303 / 342 ms, against
+319–633 ms for the build that became #107. Locally (the 4-vCPU container of "Local measurements", one worker on one
+core, no packet loss, so neither option has anything to act on), #107 and this build alternating at 18,000 users and
+`-think-scale 0.07`, about 23,700 requests a second, CPU over 10 s of the hold:
+
+| build | server ticks | Postgres ticks | p95 | p99 |
+|---|--:|--:|--:|--:|
+| #107 | 409 / 390 | 1,078 / 1,059 | 27.0 / 27.8 ms | 51.6 / 50.6 ms |
+| this one | 405 / 407 | 1,063 / 1,099 | 27.0 / 32.0 ms | 48.1 / 58.1 ms |
+
+No difference, as expected without loss. `tc netem` is not available in that container, so the effect under loss
+is not measured here: go-epoll-trungdlp's README has it for the first option (10% loss on the server's egress,
+20,000 users: p99 633–897 ms down to 438).
+
+**Tried and left out: a fixed 2 ms cadence** (c-epoll-unorig-username's and csharp-epoll-jh-d's window: a pass
+starts at most every 2 ms, counted from its wake-up, unless it filled its event array). Here `pollWait` gives at most
+64 events and the window is "pause 2 ms after a turn of fewer than 32". At 23,700 requests a second the fixed cadence
+(with both options on) took Postgres from 1,096 / 1,073 ticks to 1,058 / 1,037 and the server from 391 / 393 to 409 / 414: nothing either
+way, so the window stays as #107 ran it.
+
+`test/run.sh`: 42/42.
 
 ## What carried over from the multicore challenge
 
@@ -92,7 +163,7 @@ Carried over:
 
 | Variable | Default | |
 |---|---|---|
-| `HTTP_WORKERS` | the CPUs (3 on 4 CPUs) | worker processes; on 4 CPUs one core is left to the kernel's network work, see "This update, 4 cores" |
+| `HTTP_WORKERS` | the CPUs (3 on 4 CPUs) | worker processes; on 4 CPUs one core is left to the kernel's network work, see "#107, 4 cores" |
 | `DB_READ_CONNS` | 48 | total read connections, split over the workers |
 | `DB_WRITE_CONNS` | 64 | total write connections, split over the workers |
 | `DB_MAX_IN_FLIGHT` | 16 | groups pipelined on one connection |
@@ -105,12 +176,14 @@ Carried over:
 | `DB_PACK` | on | reads fill one connection to `DB_MAX_IN_FLIGHT` before the next (`0` spreads them over all) |
 | `DB_BINARY` | on | reads ask Postgres for binary results (`0` for text) |
 | `DB_READ_BATCH` | 64 | the most reads under one Sync (`1`: each read its own Sync, as in #56) |
-| `DB_WRITE_BATCH` | 128 | the most writes one group commits (`1`: each write its own transaction; unlike #56, one at a time on each write connection, so not for load, see "This update, 4 cores") |
+| `DB_WRITE_BATCH` | 128 | the most writes one group commits (`1`: each write its own transaction; unlike #56, one at a time on each write connection, so not for load, see "#107, 4 cores") |
+| `TCP_THIN` | on | `TCP_THIN_LINEAR_TIMEOUTS` on the client and Postgres sockets (`0` = off) |
+| `TCP_DEFER` | on | `TCP_DEFER_ACCEPT` on the listeners, and a new connection read as it is accepted (`0` = off) |
 
 ## Measured on Synteq boxes
 
-The runs below are of #56's build (Nish 0.25.0 and 0.26.0, before group commit and batched reads), except "This
-update, 4 cores", which is this build.
+The runs below are of #56's build (Nish 0.25.0 and 0.26.0, before group commit and batched reads), except "#107, 4
+cores", which is #107's build.
 
 Laid out like the official runs: the server on a 16-vCPU / 32 GB app box with 5 IPs (set up with
 `box/setup-app-box.sh`), Postgres 18 on its own 24-vCPU box (`box/setup-db-box.sh`, `box/postgresql.conf`), and
@@ -177,7 +250,9 @@ box still has CPU to spare, and both boxes retransmit 2,000–3,000 segments a s
 database sends the app box about 1 Gbit/s of rows, and on these VMs' network the read connections stall on lost
 packets before the server runs out of CPU.
 
-### This update, 4 cores
+### #107, 4 cores
+
+"This build" in this section is #107's.
 
 The same boxes, with the app box cut to 4 CPUs and `box/setup-app-box.sh` run again. The server ran as
 `challenge.service` with the box's env, from a fresh `feed` each run, and the load came from all three load boxes
@@ -231,7 +306,7 @@ Other settings at 1,000,000 users, 2-minute holds, two runs each:
 |---|--:|--:|--:|:--|
 | `HTTP_WORKERS=3` | 239 / 244 ms | 319 / 579 ms | 56% / 56% (**60% / 60%**) | pass / pass |
 | `BATCH_MIN=512` | 244 / 1,505 ms | 479 / 6,896 ms | 54% / 54% (70% / 70%) | pass / fail |
-| `TCP_THIN_LINEAR_TIMEOUTS` + `TCP_DEFER_ACCEPT` (not in this build) | 223 / 225 ms | 303 / 342 ms | 56% / 56% (76% / 77%) | pass / pass |
+| `TCP_THIN_LINEAR_TIMEOUTS` + `TCP_DEFER_ACCEPT` (not in #107; in the build after it) | 223 / 225 ms | 303 / 342 ms | 56% / 56% (76% / 77%) | pass / pass |
 
 With 3 workers on 4 cores the scheduler keeps them off the core that takes the NIC's interrupts. That core's own
 user + sys time falls from about 31% to 18% and it ends up 40% idle instead of 22%, but each worker carries more
@@ -282,6 +357,16 @@ From this challenge's entries ([arjaythedev/million-users-challenge](https://git
 - **c-epoll-unorig-username (#10) and rust-tokio-unorig-username (#11):** packing reads onto as few connections as
   will take them, and binary result columns (with java-epoll-stohirov (#2) and c-iouring-einhornimmond
   ([#12](https://github.com/arjaythedev/million-users-challenge/pull/12))).
+- **c-epoll-unorig-username (#10, [#104](https://github.com/arjaythedev/million-users-challenge/pull/104)) and
+  go-epoll-trungdlp ([#65](https://github.com/arjaythedev/million-users-challenge/pull/65)):**
+  `TCP_THIN_LINEAR_TIMEOUTS` on the client sockets (through the listeners) and on the Postgres sockets. The Go
+  entry's README measures it under loss.
+- **c-epoll-unorig-username (#104), with go-epoll-trungdlp (#65) and fsharp-kestrel-uring-delneg
+  ([#35](https://github.com/arjaythedev/million-users-challenge/pull/35),
+  [#105](https://github.com/arjaythedev/million-users-challenge/pull/105)) for options on the listeners:**
+  `TCP_DEFER_ACCEPT`, and serving a new connection's first request in the pass that accepts it.
+- **c-epoll-unorig-username and csharp-epoll-jh-d (#59):** the fixed 2 ms cadence that "This update" tried and left
+  out.
 - **csharp-epoll-jh-d ([#59](https://github.com/arjaythedev/million-users-challenge/pull/59)),
   go-epoll-trungdlp ([#65](https://github.com/arjaythedev/million-users-challenge/pull/65)), java-epoll-stohirov
   (#2, [#78](https://github.com/arjaythedev/million-users-challenge/pull/78)) and c-epoll-unorig-username (#10,
@@ -291,7 +376,7 @@ From this challenge's entries ([arjaythedev/million-users-challenge](https://git
 
 ## Local measurements
 
-### This update
+### #107
 
 The same 4-vCPU container, Postgres 16 on cores 1–3, the server on core 0 (`taskset -c 0`, `HTTP_WORKERS=1`) and
 `mload` on cores 1 and 2, `-gzip`, a fresh copy of the seed each run, a 15 s ramp and a 40 s hold. CPU is the

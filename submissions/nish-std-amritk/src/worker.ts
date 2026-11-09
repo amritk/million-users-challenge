@@ -140,6 +140,24 @@ const idOf = (b: u8[], start: i32, end: i32): i64 => {
 /** JavaScript's `trim()` whitespace in ASCII: space, tab, LF, VT, FF, CR. */
 const isSpace = (c: i32): boolean => c === 32 || (c >= 9 && c <= 13)
 
+/**
+ * libc's `setsockopt`, for the two TCP options below: `netSetOption` has no id for them. `value` is the option's
+ * `int`, as its 4 bytes.
+ */
+declare function setsockopt(fd: i32, level: i32, name: i32, value: readonly u8[], length: u64): i32
+
+const IPPROTO_TCP: i32 = 6
+/** A listener hands a connection to `accept` only once its first bytes have come (the value: seconds to wait for them). */
+export const TCP_DEFER_ACCEPT: i32 = 9
+/** While fewer than 4 packets are in flight, a packet lost again is resent after one RTO each time, not 2, 4, 8. */
+export const TCP_THIN_LINEAR_TIMEOUTS: i32 = 16
+
+/** Sets the TCP option `name` of `fd` to 1; whether the kernel took it. Accepted sockets inherit both from their listener. */
+export const tcpOption = (fd: i32, name: i32): boolean => {
+  const one: u8[] = [1, 0, 0, 0]
+  return setsockopt(fd, IPPROTO_TCP, name, one, 4) === 0
+}
+
 export class WorkerConfig {
   host: string = "0.0.0.0"
   ports: i32[]
@@ -161,6 +179,10 @@ export class WorkerConfig {
   /** The wake-up batching window: after a loop turn with fewer than `batchMin` events, pause `batchMs` (0 = off). */
   batchMs: i32 = 2
   batchMin: i32 = 32
+  /** `TCP_DEFER_ACCEPT` is on the listeners, so a connection is read as soon as it is accepted. */
+  deferAccept: boolean = true
+  /** `TCP_THIN_LINEAR_TIMEOUTS` on the Postgres sockets (the listeners' is set where they are opened). */
+  thinTimeouts: boolean = true
   /** Reads fill one connection to `maxInFlight` before the next (`PgConfig.pack`), so their results go in fuller packets. */
   pack: boolean = true
   /** Reads ask for binary results: ids, like counts and timestamps come as fixed-size integers, not text. */
@@ -310,6 +332,8 @@ export class FeedWorker {
   pause: i32 = -1
   batchMs: i32 = 2
   batchMin: i32 = 32
+  deferAccept: boolean = true
+  thinTimeouts: boolean = true
   binary: boolean = true
   jwt: Jwt
   pools: PgPool[]
@@ -356,6 +380,8 @@ export class FeedWorker {
     this.pause = pollCreate()
     this.batchMs = cfg.batchMs
     this.batchMin = cfg.batchMin
+    this.deferAccept = cfg.deferAccept
+    this.thinTimeouts = cfg.thinTimeouts
     this.binary = cfg.binary
     this.listeners = listeners
     this.servers = []
@@ -521,6 +547,12 @@ export class FeedWorker {
           this.slotReq[sv][slot] = -1
         }
         pollAdd(this.loop, server.fd(slot), H1_WANT_READ, sv * SLOT_SPAN + slot)
+        if (this.deferAccept) {
+          // `TCP_DEFER_ACCEPT`: the first request is usually here already, so it is served in this pass and not
+          // in a second wake-up. A socket with nothing yet reads -11 and waits for its event as before.
+          server.readable(slot)
+          this.drive(sv, slot)
+        }
       } else if (slot !== H1_POOL_FULL) {
         return
       }
@@ -929,6 +961,9 @@ export class FeedWorker {
         crypto.getRandomValues(nonce)
         pool.connect(s, nonce)
         socket.fd = tcpConnect(this.pgAddress)
+        if (socket.fd >= 0 && this.thinTimeouts) {
+          tcpOption(socket.fd, TCP_THIN_LINEAR_TIMEOUTS)
+        }
         socket.connected = false
         socket.armed = H1_WANT_WRITE
         if (socket.fd < 0 || pollAdd(this.loop, socket.fd, H1_WANT_WRITE, TOKEN_POOL - (p * POOL_TOKENS + s)) < 0) {

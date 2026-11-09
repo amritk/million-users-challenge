@@ -14,7 +14,7 @@
 import { availableParallelism, getenv, monotonicNanos } from "nish:process"
 import { tcpListenFlags } from "nish:net"
 import { PREFORK_STOPPED, PreforkConfig, preforkWith } from "nish/net/prefork"
-import { FeedWorker, WorkerConfig } from "./worker"
+import { FeedWorker, TCP_DEFER_ACCEPT, TCP_THIN_LINEAR_TIMEOUTS, WorkerConfig, tcpOption } from "./worker"
 
 /** `tcpListenFlags`: SO_REUSEPORT, and TCP_NODELAY on every accepted socket. */
 const LISTEN_FLAGS: i32 = 3
@@ -113,6 +113,8 @@ export const main = (): i32 => {
   cfg.gzipMin = envInt("GZIP_MIN", 1024)
   cfg.batchMs = (getenv("BATCH_MS") ?? "") === "0" ? 0 : envInt("BATCH_MS", 2)
   cfg.batchMin = envInt("BATCH_MIN", 32)
+  cfg.deferAccept = (getenv("TCP_DEFER") ?? "") !== "0"
+  cfg.thinTimeouts = (getenv("TCP_THIN") ?? "") !== "0"
   cfg.pack = (getenv("DB_PACK") ?? "") !== "0"
   // Statements under one Sync: up to DB_READ_BATCH reads, and a group commit of up to DB_WRITE_BATCH writes.
   cfg.readBatch = envInt("DB_READ_BATCH", 64)
@@ -131,6 +133,14 @@ export const main = (): i32 => {
     if (fd < 0) {
       console.log(`feed: cannot listen on ${cfg.host}:${cfg.ports[k]} (${fd})`)
       return 1
+    }
+    // Both are inherited by the sockets this listener accepts. Neither is a kernel setting (rule 13): they are
+    // options of this server's own sockets, as TCP_NODELAY is.
+    if (cfg.thinTimeouts) {
+      tcpOption(fd, TCP_THIN_LINEAR_TIMEOUTS)
+    }
+    if (cfg.deferAccept && !tcpOption(fd, TCP_DEFER_ACCEPT)) {
+      cfg.deferAccept = false
     }
     listeners.push(fd)
   }
